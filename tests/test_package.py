@@ -67,6 +67,16 @@ def test_cli_find_edit_render_roundtrip():
     assert all(o["kind"] == "text" for o in objs) and any("March 9" in o["text"] for o in objs)
 
 
+def test_cli_render_default_path_keeps_folder_names():
+    folder = os.path.join(TMP, "x.pdf_dir")              # ".pdf" inside a folder name
+    os.makedirs(folder, exist_ok=True)
+    src = os.path.join(folder, "doc.pdf")
+    shutil.copy(os.path.join(FIX, "reportlab_arial.pdf"), src)
+    png = cli("render", src, "--page", "0")
+    assert os.path.realpath(png["image"]) == os.path.realpath(os.path.join(folder, "doc-page0.png")), png
+    assert os.path.getsize(png["image"]) > 500
+
+
 def test_cli_script_follows_renamed_ids_and_is_all_or_nothing():
     src = copy("right_aligned.pdf")
     objs = cli("objects", src, "--kinds", "text")["objects"]

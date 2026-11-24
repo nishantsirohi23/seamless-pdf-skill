@@ -52,6 +52,13 @@ class Asset:
     height: int
 
 
+def _shallow(d) -> pikepdf.Dictionary:
+    """A new dictionary with the same entries (the values are shared)."""
+    if not isinstance(d, pikepdf.Dictionary):
+        return pikepdf.Dictionary()
+    return pikepdf.Dictionary({k: d[k] for k in d.keys()})
+
+
 def open_pdf(data: bytes) -> pikepdf.Pdf:
     try:
         pdf = pikepdf.open(io.BytesIO(data))
@@ -65,11 +72,15 @@ def open_pdf(data: bytes) -> pikepdf.Pdf:
 
 
 def pdf_to_bytes(pdf: pikepdf.Pdf, final: bool = False) -> bytes:
+    # a PDF opened without a password but encrypted (an owner password with
+    # restrictions) keeps its encryption and permissions; the undo snapshots
+    # keep it too, so it survives undo and rollback
+    keep = {"encryption": True} if pdf.is_encrypted else {}
     buf = io.BytesIO()
     if final:
-        pdf.save(buf, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+        pdf.save(buf, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate, **keep)
     else:
-        pdf.save(buf, compress_streams=False, normalize_content=False)
+        pdf.save(buf, compress_streams=False, normalize_content=False, **keep)
     return buf.getvalue()
 
 
@@ -90,11 +101,19 @@ class DocCore:
     def _ensure_names(self) -> None:
         """Give every annotation/widget a unique /NM: object numbers change
         whenever qpdf re-saves the file (undo, rollback), names do not, so
-        ids built on them stay valid."""
-        import pikepdf
+        ids built on them stay valid. An annotation written straight into
+        /Annots (a direct object) becomes an indirect one, so it has an
+        identity of its own."""
         for page in self.pdf.pages:
-            for a in page.obj.get("/Annots", []) or []:
+            annots = page.obj.get("/Annots")
+            if not isinstance(annots, pikepdf.Array):
+                continue
+            for i in range(len(annots)):
                 try:
+                    a = annots[i]
+                    if isinstance(a, pikepdf.Dictionary) and not a.is_indirect:
+                        a = self.pdf.make_indirect(a)
+                        annots[i] = a
                     if isinstance(a, pikepdf.Dictionary) and "/NM" not in a:
                         a.NM = pikepdf.String(uuid.uuid4().hex[:16])
                 except Exception:
@@ -235,6 +254,42 @@ class DocCore:
         self._models[page_no] = (self._dirty, m)
         return m
 
+    def _own_streams(self, page_no: int, skeys) -> bool:
+        """Give page `page_no` its own copy of every form XObject in `skeys`
+        that another page also draws (a shared header or footer), so editing
+        it here cannot change the other pages. The page's current model is
+        updated in place (same stream keys and instruction indexes); True if
+        anything was copied."""
+        model = self.model(page_no)
+        made = False
+        for skey in skeys:
+            made = self._own_form(page_no, model, skey) or made
+        if made:
+            self._touch(page_no)
+        return made
+
+    def _own_form(self, page_no: int, model: PageModel, skey) -> bool:
+        si = model.streams.get(skey)
+        if skey == "page" or si is None or si.parent not in model.streams or not si.name:
+            return False
+        key = ("form", si.owner.objgen)
+        if not any(key in self.model(q).streams for q in range(len(self.pdf.pages)) if q != page_no):
+            return False
+        self._own_form(page_no, model, si.parent)      # a shared form can be nested in another
+        parent = model.streams[si.parent]
+        copy = pikepdf.Stream(self.pdf, si.owner.read_bytes())
+        for k in si.owner.keys():
+            if k not in ("/Length", "/Filter", "/DecodeParms"):
+                copy[k] = si.owner[k]
+        copy = self.pdf.make_indirect(copy)
+        res = _shallow(parent.resources)
+        res["/XObject"] = _shallow(res.get("/XObject"))
+        res["/XObject"][si.name] = copy
+        (parent.owner.obj if parent.key == "page" else parent.owner).Resources = res
+        parent.resources = res
+        si.owner = copy
+        return True
+
     def learn_glyph_usage(self) -> None:
         """Subset fonts can only draw glyphs the document already uses;
         interpret every page once so `used_codes` covers the whole file."""
@@ -352,14 +407,18 @@ class DocCore:
 
     def delete_objects(self, ids: list[str]) -> dict:
         with self.transaction("Delete"):
-            # images first: deleting text never moves an image, but removing an
-            # image instruction shifts instruction indices inside its stream
-            for oid in sorted(ids, key=lambda i: self.kind_of(i) != "image"):
+            # images first and all at once: their ids are paint-order indexes, and
+            # removing an image instruction shifts later instruction indexes in its
+            # stream; deleting text never moves an image
+            images = [oid for oid in ids if self.kind_of(oid) == "image"]
+            if images:
+                self.delete_images(images)
+            for oid in ids:
                 kind = self.kind_of(oid)
                 if kind == "text":
                     self.delete_text(oid)
                 elif kind == "image":
-                    self.delete_image(oid)
+                    continue
                 elif kind == "annotation":
                     self.delete_annotation(oid)
                 else:

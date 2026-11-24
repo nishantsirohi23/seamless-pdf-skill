@@ -78,7 +78,11 @@ PATTERNS = {
 
 
 def _match_glyphs(doc, page_no: int, needles: set[str], case_sensitive: bool):
-    """[(glyphs, bbox)] for every occurrence of each needle on the page."""
+    """[(glyphs, bbox)] for every occurrence of each needle on the page. A
+    glyph that stands for several characters (a ligature such as "ffi") is
+    listed once per character, so text and glyph positions stay aligned; a
+    match that covers part of a ligature takes the whole glyph."""
+    fold = (lambda t: t) if case_sensitive else str.lower
     found = []
     for line in doc._lines(page_no):
         line = sorted(line, key=lambda s: s.origin[0])
@@ -88,15 +92,18 @@ def _match_glyphs(doc, page_no: int, needles: set[str], case_sensitive: bool):
                 chars.append(" ")
                 glyphs.append(None)
             for g in s.glyphs:
-                chars.append(g.char or "�")
-                glyphs.append(g)
-        text = "".join(chars)
-        hay = text if case_sensitive else text.lower()
+                for c in fold(g.char or "�"):
+                    chars.append(c)
+                    glyphs.append(g)
+        hay = "".join(chars)
         for n in sorted(needles, key=len, reverse=True):
-            q = n if case_sensitive else n.lower()
+            q = fold(n)
             start = hay.find(q)
             while start >= 0 and q:
-                sel = [g for g in glyphs[start:start + len(q)] if g is not None]
+                sel = []
+                for g in glyphs[start:start + len(q)]:
+                    if g is not None and not any(g is h for h in sel):
+                        sel.append(g)
                 if sel:
                     box = sel[0].bbox
                     for g in sel[1:]:
@@ -104,6 +111,96 @@ def _match_glyphs(doc, page_no: int, needles: set[str], case_sensitive: bool):
                     found.append((sel, box))
                 start = hay.find(q, start + len(q))
     return found
+
+
+def _hits(text: str, pats: list[str], flags: int):
+    """Strings in `text` matched by the regex patterns."""
+    for pat in pats:
+        for m in re.finditer(pat, text, flags):
+            hit = m.group(0).strip()
+            if pat == PATTERNS["phone"] and not 7 <= sum(c.isdigit() for c in hit) <= 15:
+                continue
+            if hit:
+                yield hit
+
+
+def _scrub(text: str, terms: list[str], pats: list[str], flags: int, repl: str) -> tuple[str, set]:
+    """`text` with every term and pattern match replaced by `repl`, and the hits."""
+    hits = {t for t in terms if re.search(re.escape(t), text, flags)} | set(_hits(text, pats, flags))
+    for h in sorted(hits, key=len, reverse=True):
+        text = re.sub(re.escape(h), lambda _m: repl, text, flags=flags)
+    return text, hits
+
+
+def _redact_annots(doc, page_no: int, terms, pats, flags, repl: str) -> tuple[int, int, set]:
+    """Remove matches from form-field values and annotation text on the page;
+    they live outside the page content, so erasing glyphs never reaches them.
+    Widgets of a cleaned field lose their old appearance and get a new one
+    built from the cleaned value; a FreeText annotation whose text matched
+    loses its appearance (it showed the old text). (fields, annotations, hits)"""
+    fields = notes = 0
+    hits: set = set()
+    seen: set = set()
+    stale: list = []
+
+    def clean(d, keys) -> bool:
+        changed = False
+        for k in keys:
+            v = d.get(k)
+            if isinstance(v, pikepdf.String):
+                new, h = _scrub(str(v), terms, pats, flags, repl)
+                if h:
+                    d[k] = pikepdf.String(new)
+                    hits.update(h)
+                    changed = True
+        return changed
+
+    for a in doc.page(page_no).obj.get("/Annots", []) or []:
+        if not isinstance(a, pikepdf.Dictionary):
+            continue
+        sub = str(a.get("/Subtype", ""))
+        if sub == "/Widget":
+            node, depth = a, 0
+            while isinstance(node, pikepdf.Dictionary) and depth < 20:
+                key = node.objgen if node.is_indirect else ("direct", id(node))
+                if key not in seen:
+                    seen.add(key)
+                    changed = clean(node, ("/V", "/DV"))
+                    opts = node.get("/Opt")
+                    if isinstance(opts, pikepdf.Array):
+                        for o in opts:
+                            if isinstance(o, pikepdf.Array):
+                                for i in range(len(o)):
+                                    if isinstance(o[i], pikepdf.String):
+                                        new, h = _scrub(str(o[i]), terms, pats, flags, repl)
+                                        if h:
+                                            o[i] = pikepdf.String(new)
+                                            hits.update(h)
+                                            changed = True
+                        for i in range(len(opts)):
+                            if isinstance(opts[i], pikepdf.String):
+                                new, h = _scrub(str(opts[i]), terms, pats, flags, repl)
+                                if h:
+                                    opts[i] = pikepdf.String(new)
+                                    hits.update(h)
+                                    changed = True
+                    if changed:
+                        fields += 1
+                        stale.extend(node.get("/Kids", []) if "/Kids" in node else [node])
+                node = node.get("/Parent")
+                depth += 1
+        elif sub != "/Popup":
+            if clean(a, ("/Contents", "/RC", "/T", "/Subj")):
+                notes += 1
+                if sub == "/FreeText" and "/AP" in a:
+                    del a["/AP"]
+    if stale:
+        for w in stale:
+            if isinstance(w, pikepdf.Dictionary) and "/AP" in w:
+                del w["/AP"]
+        doc._regen()
+        doc.touch_all()   # a field's widgets can sit on other pages
+    return fields, notes, hits
 
 
 def _black_out_images(doc, page_no: int, boxes: list[Rect]) -> int:
@@ -163,42 +260,44 @@ def redact_pdf(ctx, doc, terms=None, presets=None, regex=None, case_sensitive=Fa
         raise EditError("give terms, presets or regex")
     flags = 0 if case_sensitive else re.IGNORECASE
     rgb = parse_color(fill)
+    terms = [t for t in (terms or []) if t]
     report = []
     for p in parse_pages(pages, doc.page_count):
-        text = doc.page_text(p)
-        needles = {t for t in (terms or []) if t}
-        for pat in pats:
-            for m in re.finditer(pat, text, flags):
-                hit = m.group(0).strip()
-                if pat == PATTERNS["phone"] and not 7 <= sum(c.isdigit() for c in hit) <= 15:
-                    continue
-                if hit:
-                    needles.add(hit)
-        found = _match_glyphs(doc, p, needles, case_sensitive)
-        if not found:
-            continue
-        doc._erase(p, [g for gl, _ in found for g in gl])
-        boxes = [b for _, b in found]
-        images = _black_out_images(doc, p, boxes)
-        Pi = doc.model(p).P.inverse()
-        ops = []
-        for b in boxes:
-            r = b.transform(Pi)
-            ops.append(f"q {color_op(rgb)} {r.x0:.3f} {r.y0:.3f} {r.width:.3f} {r.height:.3f} re f Q")
-        append_content(doc.pdf, doc.page(p), ("\n".join(ops) + "\n").encode())
-        if label:
-            from .render import draw_text_display
-            from ..engine.interp import rotation_matrix
-            _, w, h, rot = doc.geometry(p)
-            R = rotation_matrix(rot, w, h)
+        needles = set(terms) | set(_hits(doc.page_text(p), pats, flags))
+        found = _match_glyphs(doc, p, needles, case_sensitive) if needles else []
+        boxes, images = [b for _, b in found], 0
+        if found:
+            glyphs, seen = [], set()
+            for gl, _ in found:          # overlapping matches share glyphs; erase each once
+                for g in gl:
+                    if id(g) not in seen:
+                        seen.add(id(g))
+                        glyphs.append(g)
+            doc._erase(p, glyphs)
+            images = _black_out_images(doc, p, boxes)
+            Pi = doc.model(p).P.inverse()
+            ops = []
             for b in boxes:
-                d = b.transform(R)
-                size = min(8.0, d.height * 0.7)
-                draw_text_display(doc, p, label, d.x0 + 1, d.y1 - (d.height - size) / 2 - size * 0.15, size,
-                                  (1, 1, 1) if sum(rgb) < 1.5 else (0, 0, 0))
+                r = b.transform(Pi)
+                ops.append(f"q {color_op(rgb)} {r.x0:.3f} {r.y0:.3f} {r.width:.3f} {r.height:.3f} re f Q")
+            append_content(doc.pdf, doc.page(p), ("\n".join(ops) + "\n").encode())
+            if label:
+                from .render import draw_text_display
+                from ..engine.interp import rotation_matrix
+                _, w, h, rot = doc.geometry(p)
+                R = rotation_matrix(rot, w, h)
+                for b in boxes:
+                    d = b.transform(R)
+                    size = min(8.0, d.height * 0.7)
+                    draw_text_display(doc, p, label, d.x0 + 1, d.y1 - (d.height - size) / 2 - size * 0.15, size,
+                                      (1, 1, 1) if sum(rgb) < 1.5 else (0, 0, 0))
+        fields, notes, annot_hits = _redact_annots(doc, p, terms, pats, flags, label or "")
+        if not found and not fields and not notes:
+            continue
         doc._touch(p)
         report.append({"page": p + 1, "areas": len(boxes), "images_redacted": images,
-                       "matches": sorted(needles)[:50]})
+                       "fields_redacted": fields, "annotations_redacted": notes,
+                       "matches": sorted((needles if found else set()) | annot_hits)[:50]})
     if not report:
         raise EditError("nothing matched; nothing was redacted")
     ctx.result = {"redacted": report}

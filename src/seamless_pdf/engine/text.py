@@ -25,11 +25,10 @@ import pikepdf
 
 from .fonts import FontInfo
 from .geom import Matrix, Rect
-from .interp import Glyph, PageModel
+from .interp import Glyph, PageModel, rotation_matrix
 from .util import EditError, as_rect, parse_color, rect_list, rgb_to_hex
-from .writer import alpha_resource, append_content, family_std14, font_resource, insert_after_text_object, \
-    std14_name, stream_resource, \
-    text_block, write_stream
+from .writer import alpha_resource, append_content, family_std14, fill_op, font_resource, \
+    insert_after_text_object, std14_name, stream_resource, text_block, write_stream
 
 _ID = re.compile(r"^t:(\d+):(-?[\d.]+):(-?[\d.]+)(?:~(\d+))?$")
 Op = pikepdf.Operator
@@ -81,6 +80,8 @@ class Style:
     alpha: float = 1.0
     render: int = 0
     tm: Matrix = field(default_factory=Matrix)   # text matrix x CTM, PDF user space
+    fill: Optional[tuple] = None                 # exact original fill (see Glyph.fill); None: use rgb
+    fill_stream: object = None                   # the stream whose resources `fill` names
 
 
 def _seg_id(page_no: int, origin) -> str:
@@ -170,6 +171,15 @@ class TextOps:
         raise EditError(f"text {sid!r} is no longer on page {page_no}; "
                         "list the page objects again to get fresh ids")
 
+    def _resolve_own(self, sid: str) -> tuple[Seg, list[Seg]]:
+        """_resolve_seg for an edit: a form XObject the segment is drawn in
+        that other pages share is first copied for this page (ids are
+        positions, so the segment keeps its id)."""
+        seg, segs = self._resolve_seg(sid)
+        if self._own_streams(seg.page, {g.stream for g in seg.glyphs}):
+            seg, segs = self._resolve_seg(sid)
+        return seg, segs
+
     def _public(self, s: Seg) -> dict:
         f = s.font
         return {"id": s.id, "kind": "text", "page": s.page, "text": s.text,
@@ -196,11 +206,15 @@ class TextOps:
         return [self._public(s) for s in self._segments(page_no)]
 
     def _lines(self, page_no: int) -> list[list[Seg]]:
+        """Segments grouped into lines, top to bottom (each line's segments
+        are not sorted by x). Sorting is by baseline in page units, so text of
+        different sizes keeps its place on the page."""
         segs = self._segments(page_no)
         lines: list[list[Seg]] = []
-        for s in sorted(segs, key=lambda s: (round(s.origin[1] / max(s.size * 0.5, 1)), s.origin[0])):
-            if lines and abs(lines[-1][0].origin[1] - s.origin[1]) < 0.4 * max(s.size, 1) \
-                    and abs(s.dir[1]) < 1e-3:
+        for s in sorted(segs, key=lambda s: (s.origin[1], s.origin[0])):
+            first = lines[-1][0] if lines else None
+            if (first is not None and abs(s.dir[1]) < 1e-3 and abs(first.dir[1]) < 1e-3
+                    and abs(first.origin[1] - s.origin[1]) < 0.4 * max(s.size, first.size, 1)):
                 lines[-1].append(s)
             else:
                 lines.append([s])
@@ -256,7 +270,7 @@ class TextOps:
         g = seg.first
         st = Style(primary=None, primary_obj=None, std14=std, bold=b, italic=i, tfs=g.tfs or 1.0,
                    tc=g.tc, tw=g.tw, th=g.th, rise=g.rise, rgb=g.rgb, alpha=g.alpha,
-                   render=g.render, tm=g.text_ctm)
+                   render=g.render, tm=g.text_ctm, fill=g.fill, fill_stream=g.stream)
         if not family and not restyled and f.subtype != "Type3":
             self.learn_glyph_usage()
             st.primary, st.primary_obj = f, f.obj
@@ -318,6 +332,7 @@ class TextOps:
     def _erase(self, page_no: int, glyphs: list[Glyph]) -> None:
         """Cut glyphs out of their TJ strings, leaving equal-width offsets."""
         model = self.model(page_no)
+        self._own_streams(page_no, {g.stream for g in glyphs})
         by_instr: dict[tuple, list[Glyph]] = defaultdict(list)
         for g in glyphs:
             by_instr[(g.stream, g.instr)].append(g)
@@ -341,7 +356,7 @@ class TextOps:
                         new.append(pikepdf.String(data[cursor:g.pos]))
                     tfs = g.tfs or 1.0
                     space = g.tw if (g.code == 32 and g.nbytes == 1) else 0.0
-                    disp = g.font.width(g.code) * tfs + g.tc + space
+                    disp = g.font.advance(g.code) * tfs + g.tc + space   # vertical fonts advance along y
                     new.append(round(-disp * 1000.0 / tfs, 4))
                     cursor = g.pos + g.nbytes
                 if cursor < len(data):
@@ -357,6 +372,28 @@ class TextOps:
         for skey in touched:
             write_stream(self.pdf, model.streams[skey])
         self._touch(page_no)
+
+    def _fill_ops(self, st: Style, si=None, page=None) -> Optional[str]:
+        """Operators that set the fill exactly as the original text had it
+        (spot colour, CMYK, ICC, pattern), for drawing into stream `si` (or
+        on top of `page`); None to fall back to st.rgb."""
+        if st.fill is None:
+            return None
+        op, space, vals, obj = st.fill
+        if op != "cs":
+            return fill_op(op, None, vals)
+        target = si.key if si is not None else "page"
+        if space.startswith("/Device") or target == st.fill_stream:
+            return fill_op(op, space, vals)
+        if obj is None or any(isinstance(v, str) for v in vals):
+            return None          # an unknown space or a pattern: the device colour is the best fallback
+        if not obj.is_indirect:
+            obj = self.pdf.make_indirect(obj)
+        if si is not None:
+            name = stream_resource(self.pdf, si, obj, "/ColorSpace", "SC")
+        else:
+            name = str(page.add_resource(obj, pikepdf.Name.ColorSpace, prefix="SC"))
+        return fill_op(op, name, vals)
 
     def _paint(self, page_no: int, text: str, st: Style, tm: Optional[Matrix] = None,
                at: Optional[Glyph] = None) -> None:
@@ -381,7 +418,7 @@ class TextOps:
                     gs = stream_resource(self.pdf, si, gobj, "/ExtGState", "SA")
                 local = tm * at.ctm.inverse()
                 data = text_block(runs, local.list(), st.tfs, st.rgb, st.tc, st.tw, st.th, st.rise,
-                                  st.render, gs)
+                                  st.render, gs, self._fill_ops(st, si))
                 if insert_after_text_object(self.pdf, si, at.instr, data):
                     self._touch(page_no)
                     return
@@ -391,9 +428,20 @@ class TextOps:
             runs.append((run, info, font_resource(page, obj)))
         gs = alpha_resource(self.pdf, page, st.alpha) if st.alpha < 0.999 and st.render != 3 else None
         data = text_block(runs, list(tm), st.tfs, st.rgb, st.tc, st.tw, st.th, st.rise,
-                          st.render, gs)
+                          st.render, gs, self._fill_ops(st, page=page))
         append_content(self.pdf, page, data)
         self._touch(page_no)
+
+    def _id_near(self, page_no: int, origin) -> str:
+        """Id of the segment that now starts at `origin` (page space), so a
+        returned id is always one the page really has; else the id that
+        position would get."""
+        best = None
+        for s in self._segments(page_no):
+            d = abs(s.origin[0] - origin[0]) + abs(s.origin[1] - origin[1])
+            if d < 0.75 and (best is None or d < best[0]):
+                best = (d, s.id)
+        return best[1] if best else _seg_id(page_no, origin)
 
     @staticmethod
     def _anchor(seg: Seg, segs: list[Seg]) -> str:
@@ -419,7 +467,7 @@ class TextOps:
                   color=None, anchor: str = "auto", font: Optional[str] = None,
                   bold: Optional[bool] = None, italic: Optional[bool] = None) -> dict:
         with self.transaction("Edit text"):
-            seg, segs = self._resolve_seg(sid)
+            seg, segs = self._resolve_own(sid)
             new_text = seg.text if text is None else str(text).replace("\n", " ")
             if (new_text == seg.text and not font_size and color is None and font is None
                     and bold is None and italic is None):
@@ -429,9 +477,18 @@ class TextOps:
             st = self._style_for(seg, font, bold, italic)
             rgb = parse_color(color)
             if rgb is not None:
-                st.rgb = rgb
+                st.rgb, st.fill = rgb, None
             if font_size:
                 st.tfs = st.tfs * float(font_size) / max(seg.size, 0.01)
+            if seg.font.vertical:
+                # redrawn with the same vertical font from the same point; a stand-in
+                # font would run horizontally, so only the font's own glyphs can be used
+                if st.primary is None:
+                    raise EditError("vertical text can only be edited in its own font")
+                missing = "".join(dict.fromkeys(c for c in new_text if not st.primary.can_draw(c)))
+                if missing:
+                    raise EditError(f"this vertical text's font has no glyph for {missing!r}; "
+                                    "only characters the font already has can be used")
             how = self._anchor(seg, segs) if anchor in (None, "", "auto") else anchor
             if how not in ("left", "right", "center"):
                 raise EditError("anchor must be auto, left, right or center")
@@ -439,19 +496,25 @@ class TextOps:
             old_len = seg.length / units
             new_len = self._measure(new_text, st) - st.tc * st.th
             shift = {"left": 0.0, "right": old_len - new_len, "center": (old_len - new_len) / 2}[how]
+            if seg.font.vertical:
+                shift = 0.0                         # the column keeps its top
             tm = Matrix.translate(shift, 0) * st.tm
             self._erase(seg.page, seg.glyphs)
             if new_text.strip():
                 self._paint(seg.page, new_text, st, tm, at=seg.glyphs[-1])
             origin = (seg.origin[0] + seg.dir[0] * shift * units, seg.origin[1] + seg.dir[1] * shift * units)
-            new_id = _seg_id(seg.page, origin) if new_text.strip() else None
+            lead = len(new_text) - len(new_text.lstrip())
+            if lead and new_text.strip():             # a segment starts at its first visible glyph
+                skip = self._measure(new_text[:lead], st) * units
+                origin = (origin[0] + seg.dir[0] * skip, origin[1] + seg.dir[1] * skip)
+            new_id = self._id_near(seg.page, origin) if new_text.strip() else None
             self._renamed(sid, new_id)
             return {"id": new_id, "changed": True, "anchor": how,
                     "font_matched": self._matched(new_text, st), "font_used": self._fonts_used(new_text, st)}
 
     def delete_text(self, sid: str) -> dict:
         with self.transaction("Delete text"):
-            seg, _ = self._resolve_seg(sid)
+            seg, _ = self._resolve_own(sid)
             if seg.ocr:
                 self._patch_scan(seg)
             self._erase(seg.page, seg.glyphs)
@@ -459,7 +522,7 @@ class TextOps:
 
     def move_text(self, sid: str, dx: float, dy: float) -> str:
         with self.transaction("Move text"):
-            seg, segs = self._resolve_seg(sid)
+            seg, segs = self._resolve_own(sid)
             if seg.ocr:
                 return self._move_scanned(seg, segs, dx, dy)
             st = self._style_for(seg)
@@ -468,7 +531,7 @@ class TextOps:
             tm = st.tm * Matrix.translate(ux, uy)
             self._erase(seg.page, seg.glyphs)
             self._paint(seg.page, seg.text, st, tm, at=seg.glyphs[-1])
-            new_id = _seg_id(seg.page, (seg.origin[0] + dx, seg.origin[1] + dy))
+            new_id = self._id_near(seg.page, (seg.origin[0] + dx, seg.origin[1] + dy))
             self._renamed(sid, new_id)
             return new_id
 
@@ -497,17 +560,26 @@ class TextOps:
         with self.transaction("Insert text"):
             self.page(page_no)
             x, y = float(x), float(y)
+            # lay out in displayed space (the page as a viewer shows it after /Rotate), so the
+            # text reads upright, lines run down the screen and "nearby" means what it looks like
+            P, pw, ph, rot = self.geometry(page_no)
+            D = rotation_matrix(rot, pw, ph)
+            Di = D.inverse()
+            X, Y = D.apply(x, y)
             style: Optional[Seg] = None
             if match_style_of:
                 style, _ = self._resolve_seg(match_style_of)
             elif font is None or font_size is None or color is None:
-                visible = [s for s in self._segments(page_no) if not s.ocr and abs(s.dir[1]) < 1e-3]
-                above = [s for s in visible if s.origin[1] <= y + 1 and y - s.origin[1] < 4 * s.size
-                         and s.bbox.x0 - 2 * s.size <= x <= s.bbox.x1 + 2 * s.size]
+                visible = []
+                for s in self._segments(page_no):
+                    if not s.ocr and abs(D.apply_vec(*s.dir)[1]) < 1e-3:
+                        visible.append((s, D.apply(*s.origin), s.bbox.transform(D)))
+                above = [(s, o, b) for s, o, b in visible if o[1] <= Y + 1 and Y - o[1] < 4 * s.size
+                         and b.x0 - 2 * s.size <= X <= b.x1 + 2 * s.size]
                 if above:
-                    style = min(above, key=lambda s: (y - s.origin[1], abs(s.bbox.x0 - x)))
+                    style = min(above, key=lambda t: (Y - t[1][1], abs(t[2].x0 - X)))[0]
                 elif visible:
-                    style = min(visible, key=lambda s: s.bbox.distance_to(x, y))
+                    style = min(visible, key=lambda t: t[2].distance_to(X, Y))[0]
             st = self._style_for(style, font, bold, italic)
             size = float(font_size) if font_size else (style.size if style else 11.0)
             st.tfs, st.tw, st.rise, st.render = size, 0.0, 0.0, 0
@@ -515,15 +587,17 @@ class TextOps:
                 st.th = 1.0 if style is None else st.th
             rgb = parse_color(color)
             if rgb is not None:
-                st.rgb = rgb
+                st.rgb, st.fill = rgb, None
             elif style is None:
                 st.rgb = (0.0, 0.0, 0.0)
+            if st.primary is not None and st.primary.vertical:
+                st.primary = st.primary_obj = None       # inserted lines are laid out horizontally
             if st.primary is not None:
                 missing = sum(1 for c in text if not c.isspace() and not st.primary.can_draw(c))
                 if missing > len(text) // 4:
                     st.primary = st.primary_obj = None
-            P = self.model(page_no).P
-            Pi = P.inverse()
+            M = Di * P.inverse()                    # displayed page space -> PDF user space
+            ex, ey = M.apply_vec(1, 0), M.apply_vec(0, -1)
             lh = float(line_height) if line_height else size * 1.2
             lines: list[str] = []
             for para in str(text).split("\n"):
@@ -536,11 +610,11 @@ class TextOps:
                     off = float(width) - w
                 elif width and align == "center":
                     off = (float(width) - w) / 2
-                ox, oy = x + off, y + i * lh
+                ox, oy = X + off, Y + i * lh
                 if line.strip():
-                    ux, uy = Pi.apply(ox, oy)
-                    self._paint(page_no, line, st, Matrix(1, 0, 0, 1, ux, uy))
-                r = Rect(ox, oy - size, ox + w, oy + size * 0.3)
+                    ux, uy = M.apply(ox, oy)
+                    self._paint(page_no, line, st, Matrix(ex[0], ex[1], ey[0], ey[1], ux, uy))
+                r = Rect(ox, oy - size, ox + w, oy + size * 0.3).transform(Di)
                 rect = r if rect is None else rect | r
             matched = all(self._matched(ln, st) for ln in lines) and st.primary is not None
             return {"rect": rect_list(rect), "lines": len(lines), "size": size, "font_matched": matched,

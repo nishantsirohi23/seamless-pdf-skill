@@ -129,7 +129,7 @@ def cmd_render(ws, a):
     doc = ws.doc(fid)
     clip = [float(v) for v in a.clip.split(",")] if a.clip else None
     png = doc.render_page(a.page, a.scale, clip)
-    out = os.path.abspath(a.output or _default_out(a.file, f"page{a.page}").replace(".pdf", ".png"))
+    out = os.path.abspath(a.output or os.path.splitext(_default_out(a.file, f"page{a.page}"))[0] + ".png")
     with open(out, "wb") as fh:
         fh.write(png)
     _out({"image": out, "page": a.page, "scale": a.scale})

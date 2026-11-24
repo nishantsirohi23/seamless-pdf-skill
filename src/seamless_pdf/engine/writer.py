@@ -155,11 +155,27 @@ class FontBook:
 # -- page content --------------------------------------------------------------------
 def ensure_wrapped(pdf: pikepdf.Pdf, page: pikepdf.Page) -> None:
     """Wrap the existing content in q/Q once, so appended content starts
-    from a clean graphics state whatever the original left behind."""
+    from a clean graphics state whatever the original left behind: a `q`
+    the content never closes gets its `Q`, and a stray `Q` cannot pop the
+    wrapper (it gets an extra `q` in front)."""
     if page.obj.get(WRAP_KEY):
         return
-    page.contents_add(pdf.make_stream(b"q\n"), prepend=True)
-    page.contents_add(pdf.make_stream(b"\nQ\n"), prepend=False)
+    depth = lowest = 0
+    try:
+        for ins in pikepdf.parse_content_stream(page):
+            if isinstance(ins, pikepdf.ContentStreamInlineImage):
+                continue
+            op = str(ins.operator)
+            if op == "q":
+                depth += 1
+            elif op == "Q":
+                depth -= 1
+                lowest = min(lowest, depth)
+    except Exception:
+        pass
+    opens = 1 - lowest                       # keeps the depth at 1 or more inside the original content
+    page.contents_add(pdf.make_stream(b"q\n" * opens), prepend=True)
+    page.contents_add(pdf.make_stream(b"\n" + b"Q\n" * (opens + depth)), prepend=False)
     page.obj[WRAP_KEY] = True
 
 
@@ -238,15 +254,26 @@ def color_op(rgb, stroke: bool = False) -> str:
     return f"{_num(r)} {_num(g)} {_num(b)} {'RG' if stroke else 'rg'}"
 
 
+def fill_op(op: str, space: Optional[str], vals) -> str:
+    """Operators that set a fill colour as the interpreter recorded it: `g`,
+    `rg` or `k` with their operands, or `cs` with a colour space resource
+    name and the `scn` operands (numbers, or a pattern name)."""
+    args = " ".join(v if isinstance(v, str) else _num(v) for v in vals)
+    if op == "cs":
+        return f"{space} cs" + (f" {args} scn" if args else "")
+    return f"{args} {op}"
+
+
 def text_block(runs: list[tuple[str, FontInfo, str]], tm, tfs: float, rgb, tc=0.0, tw=0.0, th=1.0,
-               rise=0.0, render=0, gs_name: Optional[str] = None) -> bytes:
+               rise=0.0, render=0, gs_name: Optional[str] = None, fill: Optional[str] = None) -> bytes:
     """q BT ... ET Q drawing `runs` [(text, font info, resource name)] in order
     from text matrix `tm` (PDF user space). The text position advances
-    naturally between runs, exactly as for one string."""
+    naturally between runs, exactly as for one string. `fill` (operators
+    from fill_op) sets the colour exactly; otherwise `rgb` is used."""
     parts = ["q"]
     if gs_name:
         parts.append(f"{gs_name} gs")
-    parts += ["BT", color_op(rgb), f"{render} Tr", f"{_num(tc)} Tc", f"{_num(tw)} Tw",
+    parts += ["BT", fill or color_op(rgb), f"{render} Tr", f"{_num(tc)} Tc", f"{_num(tw)} Tw",
               f"{_num(th * 100)} Tz", f"{_num(rise)} Ts", " ".join(_num(v) for v in tm) + " Tm"]
     for text, info, res in runs:
         if not text:

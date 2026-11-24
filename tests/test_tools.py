@@ -349,6 +349,99 @@ def test_protect_unlock_redact_scrub_password():
     assert len(r["result"]["passwords"]) == 3 and all(len(p) == 16 for p in r["result"]["passwords"])
 
 
+def _raw_pdf(content: bytes, font_extra=None, annots=None) -> pikepdf.Pdf:
+    pdf = pikepdf.new()
+    font = pikepdf.Dictionary(Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+                              BaseFont=pikepdf.Name.Helvetica, Encoding=pikepdf.Name.WinAnsiEncoding)
+    if font_extra:
+        font_extra(pdf, font)
+    font = pdf.make_indirect(font)
+    pg = pikepdf.Dictionary(Type=pikepdf.Name.Page, MediaBox=[0, 0, 612, 792],
+                            Contents=pdf.make_stream(content),
+                            Resources=pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font)))
+    pdf.pages.append(pikepdf.Page(pg))
+    if annots:
+        pdf.pages[0].obj.Annots = pdf.make_indirect(pikepdf.Array(annots(pdf, font)))
+    return pdf
+
+
+def _saved(pdf: pikepdf.Pdf) -> bytes:
+    buf = io.BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
+def test_redact_ligatures_form_fields_and_annotations():
+    # codes 0x80 / 0x81 are fi / ffi ligature glyphs: one glyph, several characters
+    def ligatures(pdf, font):
+        font.Encoding = pikepdf.Dictionary(Type=pikepdf.Name.Encoding, BaseEncoding=pikepdf.Name.WinAnsiEncoding,
+                                           Differences=[128, pikepdf.Name("/fi"), pikepdf.Name("/ffi")])
+        font.ToUnicode = pdf.make_stream(
+            b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n/CMapName /L def /CMapType 2 def\n"
+            b"1 begincodespacerange <00> <FF> endcodespacerange\n1 beginbfrange <20> <7E> <0020> endbfrange\n"
+            b"2 beginbfchar <80> <00660069> <81> <006600660069> endbfchar\n"
+            b"endcmap CMapName currentdict /CMap defineresource pop end end")
+    g = S.add(_saved(_raw_pdf(b"BT /F1 12 Tf 72 700 Td (o\x81ce \x80le: john@x.com end) Tj ET", ligatures)), "lig.pdf")
+    run("redact_pdf", [g], terms=["john@x.com"])
+    t = text(doc(g))
+    assert "john" not in t and "x.com" not in t and "end" in t and "le:" in t, t
+
+    # the email only appears in a form field and in two annotations, never in the page text
+    def annots(pdf, font):
+        ap = pdf.make_stream(b"/Tx BMC BT /F1 10 Tf 2 5 Td (john@x.com) Tj ET EMC")
+        ap.Type, ap.Subtype, ap.BBox = pikepdf.Name.XObject, pikepdf.Name.Form, [0, 0, 200, 20]
+        ap.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+        field = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Widget, FT=pikepdf.Name.Tx, T=pikepdf.String("email"),
+            V=pikepdf.String("mail john@x.com"), Rect=[72, 600, 272, 620], DA=pikepdf.String("/F1 10 Tf 0 g"),
+            AP=pikepdf.Dictionary(N=ap)))
+        pdf.Root.AcroForm = pikepdf.Dictionary(Fields=[field], DA=pikepdf.String("/F1 10 Tf 0 g"))
+        note = pikepdf.Dictionary(Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Text, Rect=[300, 600, 320, 620],
+                                  Contents=pikepdf.String("call john@x.com"))
+        ft_ap = pdf.make_stream(b"BT /F1 10 Tf 2 5 Td (write to john@x.com) Tj ET")
+        ft_ap.Type, ft_ap.Subtype, ft_ap.BBox = pikepdf.Name.XObject, pikepdf.Name.Form, [0, 0, 200, 20]
+        free = pikepdf.Dictionary(Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.FreeText, Rect=[72, 500, 272, 520],
+                                  Contents=pikepdf.String("write to john@x.com"), DA=pikepdf.String("/F1 10 Tf 0 g"),
+                                  AP=pikepdf.Dictionary(N=ft_ap))
+        return [field, pdf.make_indirect(note), pdf.make_indirect(free)]
+    g = S.add(_saved(_raw_pdf(b"BT /F1 12 Tf 72 700 Td (Contact) Tj ET", annots=annots)), "fields.pdf")
+    r = run("redact_pdf", [g], presets=["email"])
+    rep = r["result"]["redacted"][0]
+    assert rep["fields_redacted"] == 1 and rep["annotations_redacted"] == 2 and rep["areas"] == 0, rep
+    out = pikepdf.open(io.BytesIO(_bytes(doc(g))))
+    field, note, free = out.pages[0].Annots
+    assert "john" not in str(field.V) and "mail" in str(field.V), field.V
+    assert b"john" not in field.AP.N.read_bytes(), field.AP.N.read_bytes()
+    assert "john" not in str(note.Contents) and "john" not in str(free.Contents)
+    assert "/AP" not in free, "the FreeText appearance still showed the old text"
+
+
+def test_markdown_never_turns_a_watermark_into_a_heading():
+    def draw(c, i, H):
+        c.setFont("Helvetica-Bold", 22)
+        c.drawString(72, H - 80, "Quarterly report")
+        c.setFont("Helvetica", 11)
+        for k in range(8):
+            c.drawString(72, H - 130 - 16 * k, f"Body line {k + 1} with ordinary text in it.")
+        c.setFillColorRGB(0.1, 0.12, 0.2)
+        c.rect(70, H - 290, 300, 18, fill=1, stroke=0)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(74, H - 285, "Header row")          # white on dark: ordinary bold text
+        c.saveState()
+        c.translate(150, 300)
+        c.rotate(30)
+        c.setFillColorRGB(0.92, 0.93, 0.96)
+        c.setFont("Helvetica-Bold", 90)
+        c.drawString(0, 0, "DRAFT")
+        c.restoreState()
+    f = S.add(make(draw), "draft.pdf")
+    md = run("extract_text", [f], format="markdown")["result"]["text"]
+    assert md.lstrip().startswith("# Quarterly report"), md
+    assert "DRAFT" in md and "#" not in md.split("DRAFT")[0].splitlines()[-1], md
+    assert "**Header row**" in md, md
+
+
 def test_sign_visual_and_digital_and_verify():
     f = pdf_with(2, "Contract")
     run("sign_pdf", [f], name="Jane Doe")

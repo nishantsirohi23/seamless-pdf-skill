@@ -159,6 +159,9 @@ class FontInfo:
     mono: bool = False
     used_codes: set = field(default_factory=set)  # codes the document draws with this font
     fallback: bool = False                        # added by the editor as a per-character stand-in
+    vertical: bool = False                        # writing mode 1 (an -V CMap such as Identity-V)
+    vmetrics: dict = field(default_factory=dict)  # code -> (w1, vx, vy) from /W2, em units
+    dw2: tuple = (0.88, -1.0)                     # /DW2: default (vy, w1)
 
     # -- decoding ---------------------------------------------------------------
     def decode(self, data: bytes) -> list[tuple[int, int]]:
@@ -185,6 +188,20 @@ class FontInfo:
 
     def width(self, code: int) -> float:
         return self.widths.get(code, self.default_w)
+
+    def vadvance(self, code: int) -> float:
+        """Vertical displacement w1 (em units, negative = down) in vertical writing."""
+        m = self.vmetrics.get(code)
+        return m[0] if m else self.dw2[1]
+
+    def vorigin(self, code: int) -> tuple[float, float]:
+        """Position vector v from the glyph's horizontal origin to its vertical origin (em units)."""
+        m = self.vmetrics.get(code)
+        return (m[1], m[2]) if m else (self.width(code) / 2, self.dw2[0])
+
+    def advance(self, code: int) -> float:
+        """Displacement along the writing direction, em units."""
+        return self.vadvance(code) if self.vertical else self.width(code)
 
     # -- encoding new text with this font ------------------------------------------
     def uni2code(self) -> dict[str, int]:
@@ -257,6 +274,34 @@ def _widths_cid(desc_font, info: FontInfo) -> None:
             break
 
 
+def _vmetrics_cid(desc_font, info: FontInfo) -> None:
+    """/DW2 [vy w1] and /W2: c [w1 vx vy ...] or c_first c_last w1 vx vy."""
+    dw2 = desc_font.get("/DW2")
+    if dw2 is not None and len(dw2) >= 2:
+        info.dw2 = (_num(dw2[0], 880) / 1000.0, _num(dw2[1], -1000) / 1000.0)
+    w2 = desc_font.get("/W2")
+    if w2 is None:
+        return
+    items = list(w2)
+    i = 0
+    while i < len(items):
+        c = int(items[i])
+        if i + 1 < len(items) and isinstance(items[i + 1], pikepdf.Array):
+            vals = [_num(v) / 1000.0 for v in items[i + 1]]
+            for k in range(len(vals) // 3):
+                info.vmetrics[c + k] = tuple(vals[3 * k:3 * k + 3])
+            i += 2
+        elif i + 4 < len(items):
+            c2 = int(items[i + 1])
+            m = tuple(_num(v) / 1000.0 for v in items[i + 2:i + 5])
+            if c2 - c <= 0xFFFF:
+                for cc in range(c, c2 + 1):
+                    info.vmetrics[cc] = m
+            i += 5
+        else:
+            break
+
+
 def load_font(font: pikepdf.Dictionary) -> FontInfo:
     subtype = str(font.get("/Subtype", "/Type1")).lstrip("/")
     base = str(font.get("/BaseFont", "/Unknown")) if "/BaseFont" in font else \
@@ -278,6 +323,9 @@ def load_font(font: pikepdf.Dictionary) -> FontInfo:
         if isinstance(enc, pikepdf.Stream):
             _, spaces = _parse_tounicode(enc.read_bytes())
             info.codespace = sorted(spaces, key=lambda s: s[0])
+            info.vertical = int(_num(enc.get("/WMode", 0))) == 1
+        elif isinstance(enc, pikepdf.Name):
+            info.vertical = str(enc).endswith("-V")
     if desc is not None:
         info.embedded = any(k in desc for k in ("/FontFile", "/FontFile2", "/FontFile3"))
         asc, dsc = _num(desc.get("/Ascent", 0)), _num(desc.get("/Descent", 0))
@@ -339,6 +387,8 @@ def load_font(font: pikepdf.Dictionary) -> FontInfo:
     if subtype == "Type0":
         if desc_font is not None:
             _widths_cid(desc_font, info)
+            if info.vertical:
+                _vmetrics_cid(desc_font, info)
     else:
         _widths_simple(font, info)
     return info

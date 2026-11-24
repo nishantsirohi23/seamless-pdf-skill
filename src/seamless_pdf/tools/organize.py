@@ -378,14 +378,29 @@ def extract_images(ctx, format="original", min_size=32, pages="all"):
     ctx.result = {"images": len(files)}
 
 
+def _decorative(s, body: float) -> bool:
+    """Watermark-like text: rotated, mostly transparent, or pale and far
+    larger than the body text (a "PAID" or "DRAFT" across the page). It is
+    kept as text but never decides or becomes a heading. Pale text of normal
+    size (white on a dark table header) is ordinary text."""
+    r, g, b = s.rgb
+    pale = 0.299 * r + 0.587 * g + 0.114 * b > 0.85
+    return abs(s.dir[1]) > 1e-3 or s.alpha < 0.5 or (pale and s.size >= 2.5 * body)
+
+
 def to_markdown(eng, pages: list[int]) -> str:
     """Markdown from the glyph model: headings by size, bold runs, lists."""
+    plain: Counter = Counter()
+    for p in pages:
+        for s in eng._segments(p):
+            if not _decorative(s, float("inf")):
+                plain[round(s.size, 1)] += len(s.text)
+    body = plain.most_common(1)[0][0] if plain else 11
     sizes: Counter = Counter()
     for p in pages:
         for s in eng._segments(p):
-            if not s.ocr or True:
+            if not _decorative(s, body):
                 sizes[round(s.size, 1)] += len(s.text)
-    body = sizes.most_common(1)[0][0] if sizes else 11
     heads = sorted({sz for sz in sizes if sz >= body * 1.18}, reverse=True)[:3]
     out = []
     for p in pages:
@@ -400,7 +415,9 @@ def to_markdown(eng, pages: list[int]) -> str:
             if prev_y is not None and y - prev_y > size * 1.9:
                 out.append("")
             prev_y = y
-            if size in heads and len(text) <= 120:
+            if all(_decorative(s, body) for s in line):
+                out.append(text)
+            elif size in heads and len(text) <= 120:
                 out += ["", "#" * (heads.index(size) + 1) + " " + text, ""]
             elif re.match(r"^[•‣●\-\*]\s+", text):
                 out.append("- " + re.sub(r"^[•‣●\-\*]\s+", "", text))
