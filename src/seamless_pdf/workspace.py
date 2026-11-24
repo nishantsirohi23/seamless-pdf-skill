@@ -113,28 +113,41 @@ class Workspace:
     def script(self, ref: str, steps: list[dict]) -> list[dict]:
         """Run several operations in order. Ids renamed by an earlier step
         (an edited segment gets a new id) are followed automatically."""
-        renamed: dict[str, str] = {}
+        # the ids in the steps name objects as they were before the first step;
+        # `current` maps such an id to the object's id now (None: deleted)
+        current: dict[str, Optional[str]] = {}
 
         def remap(v):
             if isinstance(v, str):
-                while v in renamed:
-                    v = renamed[v]
-                return v
+                if v in current and current[v] is None:
+                    raise EditError(f"{v} was deleted by an earlier step")
+                return current.get(v, v)
             if isinstance(v, list):
                 return [remap(x) for x in v]
             return v
+
+        def follow(new_ids: dict) -> None:
+            updates = {}
+            for old, new in new_ids.items():
+                if new == old:
+                    continue
+                named = [k for k, v in current.items() if v == old]
+                for k in named:
+                    updates[k] = new
+                if not named and old not in current:
+                    updates[old] = new
+            current.update(updates)      # all at once: a step can shift several ids
+
         results = []
         for i, step in enumerate(steps):
             if not isinstance(step, dict) or "op" not in step:
                 raise EditError(f"step {i + 1}: expected {{\"op\": name, \"args\": {{...}}}}")
-            args = {k: remap(v) if k in ("id", "ids") else v for k, v in (step.get("args") or {}).items()}
             try:
+                args = {k: remap(v) if k in ("id", "ids") else v for k, v in (step.get("args") or {}).items()}
                 res = self.op(ref, step["op"], args)
             except EditError as e:
                 raise EditError(f"step {i + 1} ({step['op']}): {e}")
-            for old, new in (res.get("new_ids") or {}).items():
-                if new and new != old:
-                    renamed[old] = new
+            follow(res.get("new_ids") or {})
             results.append({"op": step["op"], **res})
         return results
 

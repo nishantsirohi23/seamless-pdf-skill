@@ -323,6 +323,177 @@ def test_replace_all_and_find():
     assert texts_by_y(pdf, 1) == ["Fiscal year 2024 summary", "Totals for 2024"]
 
 
+def _pdfium_text(pdf: PdfDoc, page: int) -> str:
+    return pdfium.PdfDocument(pdf.pdf_bytes()[1])[page].get_textpage().get_text_range()
+
+
+def test_shared_form_xobject_edits_only_its_page():
+    # a footer form XObject drawn by three pages that also share one /Resources dict
+    src = pikepdf.new()
+    helv = src.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+                                                BaseFont=pikepdf.Name.Helvetica,
+                                                Encoding=pikepdf.Name.WinAnsiEncoding))
+    footer = src.make_stream(b"BT /F1 10 Tf 72 40 Td (Acme Ltd confidential) Tj ET")
+    footer.Type, footer.Subtype, footer.BBox = pikepdf.Name.XObject, pikepdf.Name.Form, [0, 0, 595, 100]
+    footer.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helv))
+    res = src.make_indirect(pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helv),
+                                               XObject=pikepdf.Dictionary(Footer=footer)))
+    for i in range(3):
+        src.pages.append(pikepdf.Page(pikepdf.Dictionary(
+            Type=pikepdf.Name.Page, MediaBox=[0, 0, 595, 842], Resources=res,
+            Contents=src.make_stream(f"/Footer Do BT /F1 14 Tf 72 760 Td (Body {i + 1}) Tj ET".encode()))))
+    buf = io.BytesIO()
+    src.save(buf)
+    pdf = PdfDoc(buf.getvalue(), "shared.pdf")
+    run(pdf, "edit_text", seg(pdf, "Acme Ltd confidential", 0)["id"], "Globex Ltd confidential")
+    assert "Globex Ltd confidential" in _pdfium_text(pdf, 0)
+    for p in (1, 2):
+        t = _pdfium_text(pdf, p)
+        assert "Acme Ltd confidential" in t and "Globex" not in t, (p, t)
+    res = run(pdf, "replace_all", "Ltd", "Limited")
+    assert res["replaced_segments"] == 3, res
+    assert "Globex Limited confidential" in _pdfium_text(pdf, 0)
+    for p in (1, 2):
+        t = _pdfium_text(pdf, p)
+        assert "Acme Limited confidential" in t and "Limited Limited" not in t, (p, t)
+        assert f"Body {p + 1}" in t
+
+
+def _raw_page(content: bytes, resources=None, rotate=0, annots=None) -> PdfDoc:
+    """One-page PDF written by hand (Helvetica as /F1), for cases ReportLab does not produce."""
+    src = pikepdf.new()
+    helv = src.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+                                                BaseFont=pikepdf.Name.Helvetica,
+                                                Encoding=pikepdf.Name.WinAnsiEncoding))
+    res = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helv))
+    if resources:
+        resources(src, res)
+    page = pikepdf.Dictionary(Type=pikepdf.Name.Page, MediaBox=[0, 0, 612, 792],
+                              Contents=src.make_stream(content), Resources=res)
+    if rotate:
+        page.Rotate = rotate
+    if annots:
+        page.Annots = pikepdf.Array(annots)
+    src.pages.append(pikepdf.Page(page))
+    buf = io.BytesIO()
+    src.save(buf)
+    return PdfDoc(buf.getvalue(), "raw.pdf")
+
+
+def _ops(pdf: PdfDoc, page=0) -> list[str]:
+    return [str(i.operator) for i in pikepdf.parse_content_stream(pdf.pdf.pages[page])
+            if not isinstance(i, pikepdf.ContentStreamInlineImage)]
+
+
+def test_spot_and_cmyk_colours_survive_an_edit():
+    def spot(src, res):
+        fn = pikepdf.Dictionary(FunctionType=2, Domain=[0, 1], C0=[0, 0, 0, 0], C1=[0, 1, 1, 0], N=1)
+        res.ColorSpace = pikepdf.Dictionary(CS0=pikepdf.Array(
+            [pikepdf.Name.Separation, pikepdf.Name("/Red"), pikepdf.Name.DeviceCMYK, fn]))
+    pdf = _raw_page(b"BT /F1 24 Tf /CS0 cs 1 scn 72 700 Td (Spot 100) Tj ET "
+                    b"BT /F1 24 Tf 0.1 0.2 0.3 0.4 k 72 600 Td (Cmyk 100) Tj ET", spot)
+    assert seg(pdf, "Spot 100")["color"] != "#000000"       # an approximation, not black
+    run(pdf, "edit_text", seg(pdf, "Spot 100")["id"], "Spot 200")
+    run(pdf, "edit_text", seg(pdf, "Cmyk 100")["id"], "Cmyk 200")
+    ops = _ops(pdf)
+    assert ops.count("scn") == 2 and ops.count("k") == 2, ops   # redrawn in the original colour spaces
+    img = pdfium.PdfDocument(pdf.pdf_bytes()[1])[0].render(scale=2).to_pil().convert("RGB")
+    ink = [img.getpixel((x, y)) for x in range(144, 420) for y in range(140, 200)]
+    ink = [p for p in ink if sum(p) < 600]
+    assert any(r > 200 and g < 60 for r, g, b in ink), sorted(set(ink))[:5]            # solid red
+    assert not any(max(p) - min(p) < 40 for p in ink), [p for p in ink if max(p) - min(p) < 40][:5]  # no grey/black
+
+
+def test_appended_content_survives_an_unclosed_q():
+    # the page scales by 0.5 and opens a q it never closes
+    pdf = _raw_page(b"0.5 0 0 0.5 0 0 cm q BT /F1 24 Tf 144 1400 Td (Hello) Tj ET")
+    run(pdf, "insert_text", 0, 72, 200, "Inserted")
+    tp = pdfium.PdfDocument(pdf.pdf_bytes()[1])[0].get_textpage()
+    first = next(i for i in range(tp.count_chars()) if tp.get_text_range(i, 1) == "I")
+    left, bottom, _, _ = tp.get_charbox(first)
+    assert abs(left - 72) < 2 and abs(bottom - (792 - 200)) < 3, (left, bottom)
+
+
+def test_vertical_text_erase_and_edit():
+    from seamless_pdf.engine.writer import FONT_DIR, FontBook
+    src = pikepdf.new()
+    font, info = FontBook(src).embedded(os.path.join(FONT_DIR, "DejaVuSans.ttf"), "ABEFXYQ")
+    font.Encoding = pikepdf.Name("/Identity-V")
+    src.pages.append(pikepdf.Page(pikepdf.Dictionary(
+        Type=pikepdf.Name.Page, MediaBox=[0, 0, 612, 792], Resources=pikepdf.Dictionary(Font=pikepdf.Dictionary(F0=font)),
+        Contents=src.make_stream(f"BT /F0 20 Tf 300 700 Td <{info.encode('ABXYEF').hex()}> Tj ET".encode()))))
+    buf = io.BytesIO()
+    src.save(buf)
+    pdf = PdfDoc(buf.getvalue(), "vertical.pdf")
+
+    def boxes():
+        tp = pdfium.PdfDocument(pdf.pdf_bytes()[1])[0].get_textpage()
+        return {tp.get_text_range(i, 1): tuple(round(v) for v in tp.get_charbox(i)) for i in range(tp.count_chars())}
+    before = boxes()
+    s = pdf.text_objects(0)[0]
+    x0, y0, x1, y1 = s["bbox"]
+    assert s["text"] == "ABXYEF" and y1 - y0 > 4 * (x1 - x0), s      # a column, not a line
+    run(pdf, "_erase", 0, [g for g in pdf._segments(0)[0].glyphs if g.char in "XY"])
+    after = boxes()
+    assert "X" not in after and all(after[c] == before[c] for c in "ABEF"), (before, after)
+    ef = seg(pdf, "EF")
+    try:
+        run(pdf, "edit_text", ef["id"], "EQ")      # Q is in the font file but this subset never drew it
+        raise AssertionError("a stand-in glyph was allowed into vertical text")
+    except EditError:
+        pass
+    run(pdf, "edit_text", ef["id"], "FE")
+    final = boxes()
+    assert final["F"] == before["E"] and final["E"] == before["F"], (before, final)
+
+
+def test_edit_returns_the_real_id_when_text_starts_with_a_space():
+    pdf = make([(0, 72, 100, "Dr. John Smith", 12)])
+    res = run(pdf, "replace_all", "Dr.", "")
+    assert res["ids"] == [o["id"] for o in pdf.text_objects(0)], (res, pdf.text_objects(0))
+
+
+def test_insert_text_reads_upright_on_a_rotated_page():
+    import pypdfium2.raw as pdfium_c
+    pdf = _raw_page(b"BT /F1 14 Tf 0 1 -1 0 300 72 Tm (Upright existing line) Tj ET", rotate=90)
+    res = run(pdf, "insert_text", 0, 100, 100, "Inserted")
+    assert res["size"] == 14 and res["font_matched"], res               # took the nearby style
+    tp = pdfium.PdfDocument(pdf.pdf_bytes()[1])[0].get_textpage()
+    angle = {tp.get_text_range(i, 1): round(pdfium_c.FPDFText_GetCharAngle(tp.raw, i), 3)
+             for i in range(tp.count_chars())}
+    assert angle["I"] == angle["U"], angle
+
+
+def test_deleting_one_direct_annotation_keeps_the_others():
+    def square(x, text):
+        return pikepdf.Dictionary(Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Square, Rect=[x, 600, x + 50, 650],
+                                  Contents=pikepdf.String(text))
+    pdf = _raw_page(b"", annots=[square(72, "one"), square(200, "two"), square(330, "three")])  # direct objects
+    run(pdf, "delete_objects", [pdf.annot_objects(0)[1]["id"]])
+    saved = pikepdf.open(io.BytesIO(pdf.to_bytes()))
+    assert [str(a.Contents) for a in saved.pages[0].obj.Annots] == ["one", "three"]
+
+
+def test_owner_password_encryption_survives_edit_and_undo():
+    plain = pikepdf.open(io.BytesIO(make([(0, 72, 100, "Amount 100", 12)]).to_bytes()))
+    buf = io.BytesIO()
+    plain.save(buf, encryption=pikepdf.Encryption(owner="owner-only", user="", R=6,
+                                                  allow=pikepdf.Permissions(modify_other=False)))
+    pdf = PdfDoc(buf.getvalue(), "locked.pdf")
+    run(pdf, "edit_text", seg(pdf, "Amount 100")["id"], "Amount 200")
+    out = pikepdf.open(io.BytesIO(pdf.to_bytes()))
+    assert out.is_encrypted and not out.allow.modify_other and "Amount 200" in _pdfium_text(pdf, 0)
+    pdf.undo()
+    again = pikepdf.open(io.BytesIO(pdf.to_bytes()))
+    assert again.is_encrypted and "Amount 100" in _pdfium_text(pdf, 0)
+
+
+def test_lines_run_top_to_bottom_whatever_the_size():
+    pdf = make([(0, 72, 100, "Heading", 20), (0, 72, 255.7, "GST 18%", 9),
+                (0, 72, 279.7, "Total due", 10.5), (0, 72, 400, "Big footer", 30)])
+    assert pdf.page_text(0).splitlines() == ["Heading", "GST 18%", "Total due", "Big footer"], pdf.page_text(0)
+
+
 def test_insert_text_matches_nearby_style():
     pdf = fixture("insert_style.pdf")
     res = run(pdf, "insert_text", 0, 72, 130, "Added line\nSecond added")
@@ -367,6 +538,58 @@ def _png(rgb=(20, 120, 220), size=(30, 30), alpha=False) -> bytes:
     buf = io.BytesIO()
     im.save(buf, "PNG")
     return buf.getvalue()
+
+
+def _three_images() -> PdfDoc:
+    pdf = make([(0, 72, 60, "Images", 12)])
+    for x, rgb in ((50, (255, 0, 0)), (200, (0, 255, 0)), (350, (0, 0, 255))):
+        a = pdf.add_asset(_png(rgb, (20, 20)), "c.png")
+        run(pdf, "insert_image", 0, a.id, [x, 100, x + 100, 200])
+    return pdf
+
+
+def _pixel(pdf: PdfDoc, x: float, y: float) -> tuple:
+    img = pdfium.PdfDocument(pdf.pdf_bytes()[1])[0].render(scale=1.0).to_pil().convert("RGB")
+    return img.getpixel((int(x), int(y)))
+
+
+def test_delete_several_images_at_once():
+    pdf = _three_images()
+    assert [o["id"] for o in pdf.image_objects(0)] == ["i:0:0", "i:0:1", "i:0:2"]
+    from seamless_pdf.ops import run_op
+    res = run_op(pdf, "delete_objects", {"ids": ["i:0:0", "i:0:1"]})
+    assert len(pdf.image_objects(0)) == 1
+    assert _pixel(pdf, 100, 150) == (255, 255, 255) and _pixel(pdf, 250, 150) == (255, 255, 255)
+    assert _pixel(pdf, 400, 150) == (0, 0, 255)
+    assert res["new_ids"] == {"i:0:2": "i:0:0", "i:0:0": None, "i:0:1": None}, res["new_ids"]
+
+
+def test_script_follows_renamed_ids():
+    import tempfile
+    from seamless_pdf import Workspace
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "imgs.pdf")
+    with open(path, "wb") as fh:
+        fh.write(_three_images().to_bytes())
+    ws = Workspace()
+    fid = ws.add(path)
+    # ids in a script name objects as they were before the first step
+    ws.script(fid, [{"op": "delete_objects", "args": {"ids": ["i:0:0"]}},
+                    {"op": "delete_objects", "args": {"ids": ["i:0:1"]}}])
+    pdf = ws.doc(fid)
+    assert len(pdf.image_objects(0)) == 1 and _pixel(pdf, 400, 150) == (0, 0, 255)
+    try:
+        ws.script(fid, [{"op": "delete_objects", "args": {"ids": ["i:0:0"]}},
+                        {"op": "delete_objects", "args": {"ids": ["i:0:0"]}}])
+        raise AssertionError("a deleted id was reused")
+    except EditError as e:
+        assert "deleted by an earlier step" in str(e), e
+    # an id that comes back to its first value (move away and back) must not loop
+    sid = ws.op(fid, "find_text", {"query": "Images"})["result"]["matches"][0]["id"]
+    ws.script(fid, [{"op": "move_objects", "args": {"ids": [sid], "dx": 10, "dy": 0}},
+                    {"op": "move_objects", "args": {"ids": [sid], "dx": -10, "dy": 0}},
+                    {"op": "edit_text", "args": {"id": sid, "text": "Pictures"}}])
+    assert texts(ws.doc(fid)) == ["Pictures"], texts(ws.doc(fid))
 
 
 def test_insert_and_replace_image_asset():

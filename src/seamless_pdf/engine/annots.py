@@ -254,8 +254,9 @@ class AnnotOps:
                     chars.append(" ")
                     boxes.append(None)
                 for g in s.glyphs:
-                    chars.append((g.char or "?").lower())
-                    boxes.append(g.bbox)
+                    for c in (g.char or "?").lower():   # a ligature glyph covers several characters
+                        chars.append(c)
+                        boxes.append(g.bbox)
             text = "".join(chars)
             start = text.find(q)
             while start >= 0:
@@ -384,8 +385,11 @@ class AnnotOps:
             page_no, a = self._resolve_annot(aid)
             page = self.page(page_no)
             popup = a.get("/Popup")
+
+            def same(x, y) -> bool:          # direct objects all share objgen (0, 0)
+                return x.is_indirect and y.is_indirect and x.objgen == y.objgen
             keep = [x for x in page.obj.Annots
-                    if not (x.objgen == a.objgen or (popup is not None and x.objgen == popup.objgen))]
+                    if not (same(x, a) or (popup is not None and same(x, popup)))]
             page.obj.Annots = pikepdf.Array(keep)
             self._touch(page_no)
             return {"deleted": aid}

@@ -120,6 +120,14 @@ class ImageOps:
                 return page_no, p
         raise EditError(f"image {iid!r} is no longer on page {page_no}")
 
+    def _resolve_image_own(self, iid: str) -> tuple[int, dict]:
+        """_resolve_image for an edit: a form XObject the image is drawn in
+        that other pages share is first copied for this page."""
+        page_no, p = self._resolve_image(iid)
+        if self._own_streams(page_no, {p["pl"].stream}):
+            page_no, p = self._resolve_image(iid)
+        return page_no, p
+
     def _rewrite(self, page_no: int, pl, new_instrs: list) -> None:
         si = self.model(page_no).streams[pl.stream]
         si.instrs[pl.instr:pl.instr + 1] = new_instrs
@@ -128,7 +136,7 @@ class ImageOps:
 
     def transform_image(self, iid: str, translate=None, rect=None) -> str:
         with self.transaction("Move image"):
-            page_no, p = self._resolve_image(iid)
+            page_no, p = self._resolve_image_own(iid)
             P = self.model(page_no).P
             old = p["bbox"]
             if rect is not None:
@@ -152,9 +160,37 @@ class ImageOps:
 
     def delete_image(self, iid: str) -> dict:
         with self.transaction("Delete image"):
-            page_no, p = self._resolve_image(iid)
-            self._rewrite(page_no, p["pl"], [])
+            self.delete_images([iid])
             return {"deleted": iid}
+
+    def delete_images(self, iids: list[str]) -> int:
+        """Delete several images. Ids are paint-order indexes, so every id is
+        resolved before anything is removed; an image painted after a deleted
+        one moves down an index, which is reported as a renamed id (deleted
+        ids are reported as renamed to None)."""
+        with self.transaction("Delete image"):
+            iids = list(dict.fromkeys(iids))
+            for iid in iids:
+                self._resolve_image_own(iid)        # shared form XObjects are copied first
+            by_page: dict[int, list] = {}
+            for iid in iids:
+                page_no, p = self._resolve_image(iid)
+                by_page.setdefault(page_no, []).append(p["pl"])
+            for page_no, pls in by_page.items():
+                before = self._placements(page_no)
+                gone = {(pl.stream, pl.instr): pl for pl in pls}
+                # from the end of each stream, so earlier instruction indexes stay valid
+                for key in sorted(gone, key=lambda k: k[1], reverse=True):
+                    self._rewrite(page_no, gone[key], [])
+                kept = [b["id"] for b in before if (b["pl"].stream, b["pl"].instr) not in gone]
+                if len(kept) == len(self._placements(page_no)):
+                    for k, old in enumerate(kept):
+                        if old != f"i:{page_no}:{k}":
+                            self._renamed(old, f"i:{page_no}:{k}")
+                for b in before:
+                    if (b["pl"].stream, b["pl"].instr) in gone:
+                        self._renamed(b["id"], None)
+            return len(iids)
 
     def insert_image(self, page_no: int, asset_id: str, rect, keep_proportion: bool = True) -> dict:
         with self.transaction("Insert image"):

@@ -52,6 +52,7 @@ class Glyph:
     bbox: Rect
     bt: int = 0                  # which BT..ET text object (page-wide counter)
     ctm: Optional[Matrix] = None  # CTM in force for this glyph (constant within BT..ET)
+    fill: Optional[tuple] = None  # exact fill colour: (op, colour space name, operands, space object)
 
 
 @dataclass
@@ -79,6 +80,8 @@ class StreamInfo:
     owner: object                # pikepdf.Page or the form XObject stream
     resources: pikepdf.Object
     instrs: list
+    parent: object = None        # for a form XObject: key of the stream that draws it ...
+    name: str = ""               # ... and the /XObject resource name it uses
 
 
 @dataclass
@@ -160,9 +163,44 @@ def _color(cs_n: int, vals: list) -> tuple:
     return (0.0, 0.0, 0.0)
 
 
+def _space_n(cs) -> int:
+    """Components of a device or ICC colour space (0 if unknown)."""
+    n = {"/DeviceGray": 1, "/DeviceRGB": 3, "/DeviceCMYK": 4}.get(str(cs), 0)
+    if not n and isinstance(cs, pikepdf.Array) and len(cs) > 1 and str(cs[0]) == "/ICCBased":
+        n = int(cs[1].get("/N", 3))
+    return n
+
+
+def _special_rgb(cs, vals: list) -> Optional[tuple]:
+    """Approximate display colour in a Separation (with an exponential tint
+    function) or Indexed colour space; None when it cannot be worked out."""
+    try:
+        family = str(cs[0])
+        if family == "/Separation" and vals:
+            fn, n = cs[3], _space_n(cs[2])
+            if int(fn.get("/FunctionType", -1)) != 2 or not n:
+                return None
+            t = max(0.0, min(1.0, _f(vals[0], 1.0)))
+            c0 = [_f(x) for x in fn.get("/C0", [0.0] * n)]
+            c1 = [_f(x) for x in fn.get("/C1", [1.0] * n)]
+            k = _f(fn.get("/N", 1.0), 1.0)
+            return _color(n, [a + t ** k * (b - a) for a, b in zip(c0, c1)])
+        if family == "/Indexed" and vals:
+            n = _space_n(cs[1])
+            lookup = cs[3]
+            data = lookup.read_bytes() if isinstance(lookup, pikepdf.Stream) else bytes(lookup)
+            i = int(_f(vals[0]))
+            comps = data[i * n:(i + 1) * n]
+            if n and len(comps) == n:
+                return _color(n, [c / 255.0 for c in comps])
+    except Exception:
+        pass
+    return None
+
+
 class _State:
     __slots__ = ("ctm", "rgb", "alpha", "cs_n", "font", "font_res", "tfs", "tc", "tw", "th",
-                 "tl", "rise", "tr")
+                 "tl", "rise", "tr", "fill")
 
     def __init__(self):
         self.ctm = IDENTITY
@@ -178,6 +216,7 @@ class _State:
         self.tl = 0.0
         self.rise = 0.0
         self.tr = 0
+        self.fill = None
 
     def copy(self) -> "_State":
         s = _State()
@@ -278,11 +317,22 @@ class Interpreter:
                 elif op in ("g", "rg", "k"):
                     gs.cs_n = {"g": 1, "rg": 3, "k": 4}[op]
                     gs.rgb = _color(gs.cs_n, list(a))
+                    gs.fill = (op, None, tuple(_f(x) for x in a), None)
                 elif op == "cs" and a:
                     gs.cs_n = self._cs_n(res, a[0])
                     gs.rgb = (0.0, 0.0, 0.0)
+                    obj = (res.get("/ColorSpace") or {}).get(a[0]) if res is not None else None
+                    gs.fill = ("cs", str(a[0]), (), obj)
                 elif op in ("sc", "scn"):
-                    gs.rgb = _color(gs.cs_n, list(a))
+                    vals = tuple(str(x) if isinstance(x, pikepdf.Name) else _f(x) for x in a)
+                    if gs.fill is not None and gs.fill[0] == "cs":
+                        gs.fill = ("cs", gs.fill[1], vals, gs.fill[3])
+                        special = _special_rgb(gs.fill[3], list(a)) if gs.cs_n == 0 else None
+                        gs.rgb = special or _color(gs.cs_n, list(a))
+                    else:
+                        op_ = {1: "g", 3: "rg", 4: "k"}.get(gs.cs_n)
+                        gs.fill = (op_, None, vals, None) if op_ else None
+                        gs.rgb = _color(gs.cs_n, list(a))
                 elif op == "gs" and a and extg is not None:
                     d = extg.get(a[0])
                     if d is not None and "/ca" in d:
@@ -296,7 +346,7 @@ class Interpreter:
                         bbox = Rect(0, 0, 1, 1).transform(gs.ctm * P)
                         model.images.append(ImagePlacement(skey, idx, str(a[0]), xo, gs.ctm, bbox))
                     elif sub == "/Form" and depth < 12 and xo.objgen not in seen:
-                        self._form(model, xo, gs, depth, seen)
+                        self._form(model, xo, gs, depth, seen, skey, str(a[0]))
                 elif op in ("m", "l"):
                     path.append(gs.ctm.apply(_f(a[0]), _f(a[1])))
                     if op == "l":
@@ -338,7 +388,7 @@ class Interpreter:
             pass
         return 0
 
-    def _form(self, model: PageModel, xo, gs: _State, depth: int, seen: set):
+    def _form(self, model: PageModel, xo, gs: _State, depth: int, seen: set, parent=None, name: str = ""):
         m = Matrix.of(xo.get("/Matrix", [1, 0, 0, 1, 0, 0]))
         inner = gs.copy()
         inner.ctm = m * gs.ctm
@@ -349,7 +399,7 @@ class Interpreter:
             except Exception:
                 return
             res = xo.get("/Resources") or model.streams["page"].resources
-            model.streams[key] = StreamInfo(key, xo, res, instrs)
+            model.streams[key] = StreamInfo(key, xo, res, instrs, parent, name)
         si = model.streams[key]
         self._run(model, key, si.instrs, si.resources, inner, depth + 1, seen | {xo.objgen})
 
@@ -372,14 +422,27 @@ class Interpreter:
                     uv = L.apply_vec(0, 1)
                     xl = (xv[0] ** 2 + xv[1] ** 2) ** 0.5 or 1.0
                     ul = (uv[0] ** 2 + uv[1] ** 2) ** 0.5 or 1.0
-                    d = (xv[0] / xl, xv[1] / xl)
-                    u = (uv[0] / ul, uv[1] / ul)
-                    adv = w * xl
-                    asc, desc = f.ascent * ul, f.descent * ul
-                    bbox = Rect.bound([(ox + u[0] * asc, oy + u[1] * asc),
-                                       (ox + u[0] * desc, oy + u[1] * desc),
-                                       (ox + d[0] * adv + u[0] * asc, oy + d[1] * adv + u[1] * asc),
-                                       (ox + d[0] * adv + u[0] * desc, oy + d[1] * adv + u[1] * desc)])
+                    if f.vertical:
+                        # the current point is the glyph's vertical origin; the glyph itself is
+                        # drawn from its horizontal origin, `v` away, and advances by w1 along y
+                        w1 = f.vadvance(code)
+                        vx, vy = f.vorigin(code)
+                        dv = L.apply_vec(0, w1 or -1.0)
+                        dl = (dv[0] ** 2 + dv[1] ** 2) ** 0.5 or 1.0
+                        d = (dv[0] / dl, dv[1] / dl)
+                        u = (xv[0] / xl, xv[1] / xl)
+                        adv = abs(w1) * ul
+                        H = Matrix.translate(-vx, -vy) * L
+                        bbox = Rect.bound([H.apply(x, y) for x in (0.0, w) for y in (f.descent, f.ascent)])
+                    else:
+                        d = (xv[0] / xl, xv[1] / xl)
+                        u = (uv[0] / ul, uv[1] / ul)
+                        adv = w * xl
+                        asc, desc = f.ascent * ul, f.descent * ul
+                        bbox = Rect.bound([(ox + u[0] * asc, oy + u[1] * asc),
+                                           (ox + u[0] * desc, oy + u[1] * desc),
+                                           (ox + d[0] * adv + u[0] * asc, oy + d[1] * adv + u[1] * asc),
+                                           (ox + d[0] * adv + u[0] * desc, oy + d[1] * adv + u[1] * desc)])
                     ch = f.char(code)
                     f.used_codes.add(code)
                     model.glyphs.append(Glyph(
@@ -387,11 +450,16 @@ class Interpreter:
                         font=f, font_res=gs.font_res, tfs=gs.tfs, tc=gs.tc, tw=gs.tw, th=gs.th,
                         rise=gs.rise, text_ctm=tm * gs.ctm, origin=(ox, oy), dir=d, up=u,
                         size=ul, adv=adv, rgb=gs.rgb, alpha=gs.alpha, render=gs.tr, bbox=bbox, bt=self.bt,
-                        ctm=gs.ctm))
+                        ctm=gs.ctm, fill=gs.fill))
                     space = gs.tw if (code == 32 and nb == 1) else 0.0
-                    tx = (w * tfs + gs.tc + space) * gs.th
-                    tm = Matrix.translate(tx, 0) * tm
+                    if f.vertical:
+                        tm = Matrix.translate(0, f.vadvance(code) * tfs + gs.tc + space) * tm
+                    else:
+                        tx = (w * tfs + gs.tc + space) * gs.th
+                        tm = Matrix.translate(tx, 0) * tm
                     pos += nb
+            elif f.vertical:
+                tm = Matrix.translate(0, -_f(el) / 1000.0 * tfs) * tm
             else:
                 tx = -_f(el) / 1000.0 * tfs * gs.th
                 tm = Matrix.translate(tx, 0) * tm
